@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -52,6 +53,14 @@ const (
 	featureVisibilityModelServing         = `["model-serving"]`
 	featureVisibilityWorkbench            = `["workbench"]`
 	containerSizeHWPPrefix                = "containersize-"
+
+	// Event reasons for upgrade operations.
+	eventReasonServerlessMigrationSkipped = "ServerlessMigrationSkipped"
+	eventSourceComponent                  = "opendatahub-operator"
+
+	// KServe deployment mode annotation.
+	kserveDeploymentModeAnnotation = "serving.kserve.io/deploymentMode"
+	kserveDeploymentModeServerless = "Serverless"
 )
 
 var defaultResourceLimits = map[string]string{
@@ -59,6 +68,37 @@ var defaultResourceLimits = map[string]string{
 	"minMemory": "8Gi",
 	"maxCpu":    "30",
 	"minCpu":    "1",
+}
+
+// recordEvent creates a Kubernetes Event for the given object.
+func recordEvent(ctx context.Context, cli client.Client, obj *unstructured.Unstructured, eventType, reason, message string) error {
+	now := metav1.NewTime(time.Now())
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: obj.GetName() + "-",
+			Namespace:    obj.GetNamespace(),
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: obj.GetAPIVersion(),
+			Kind:       obj.GetKind(),
+			Name:       obj.GetName(),
+			Namespace:  obj.GetNamespace(),
+			UID:        obj.GetUID(),
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           eventType,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+		Source: corev1.EventSource{
+			Component: eventSourceComponent,
+		},
+		ReportingController: eventSourceComponent,
+		ReportingInstance:   eventSourceComponent,
+	}
+
+	return cli.Create(ctx, event)
 }
 
 // TODO: remove function once we have a generic solution across all components.
@@ -485,6 +525,30 @@ func AttachHardwareProfileToInferenceServices(ctx context.Context, cli client.Cl
 			continue
 		}
 
+		// Skip Serverless InferenceServices as they are not supported in RHOAI 3.x
+		// Attempting to update them causes KServe webhook to incorrectly reject with deploymentMode error
+		// Check both the annotation (primary source) and status field (fallback)
+		isServerless := false
+		annotationMode := isvcAnnotations[kserveDeploymentModeAnnotation]
+		statusMode, statusFound, _ := unstructured.NestedString(isvc.Object, "status", "deploymentMode")
+
+		log.V(1).Info("Checking InferenceService deployment mode", "isvc", isvc.GetName(),
+			"annotationMode", annotationMode, "statusMode", statusMode, "statusFound", statusFound)
+
+		if annotationMode == kserveDeploymentModeServerless {
+			isServerless = true
+		} else if statusFound && statusMode == kserveDeploymentModeServerless {
+			isServerless = true
+		}
+		if isServerless {
+			log.Info("Skipping HardwareProfile migration for Serverless InferenceService", "isvc", isvc.GetName(), "deploymentMode", kserveDeploymentModeServerless)
+			if err := recordEvent(ctx, cli, isvc, corev1.EventTypeWarning, eventReasonServerlessMigrationSkipped,
+				fmt.Sprintf("Skipping HardwareProfile migration for Serverless InferenceService %s (Serverless mode not supported in RHOAI 3.x)", isvc.GetName())); err != nil {
+				log.Error(err, "Failed to record event for Serverless InferenceService", "isvc", isvc.GetName())
+			}
+			continue
+		}
+
 		// Check ServingRuntime for AcceleratorProfile annotation and apply to InferenceService
 		servingRuntime, err := getSRFromISVC(ctx, cli, isvc)
 		if err == nil {
@@ -495,6 +559,17 @@ func AttachHardwareProfileToInferenceServices(ctx context.Context, cli client.Cl
 			if apName := runtimeAnnotations[acceleratorNameAnnotation]; apName != "" {
 				hwpName := fmt.Sprintf("%s-serving", strings.ReplaceAll(strings.ToLower(apName), " ", "-"))
 				if err := setHardwareProfileAnnotation(ctx, cli, isvc, hwpName, applicationNamespace); err != nil {
+					// If webhook rejects due to Serverless mode, record event and skip instead of error
+					errStr := err.Error()
+					if strings.Contains(errStr, "deploymentMode") || strings.Contains(errStr, "Serverless") {
+						log.Info("Skipping HardwareProfile migration for InferenceService due to Serverless mode", "isvc", isvc.GetName(), "error", errStr)
+						if eventErr := recordEvent(ctx, cli, isvc, corev1.EventTypeWarning, eventReasonServerlessMigrationSkipped,
+							fmt.Sprintf("Skipping HardwareProfile migration due to Serverless mode incompatibility: %s", errStr)); eventErr != nil {
+							log.Error(eventErr, "Failed to record event for Serverless InferenceService", "isvc", isvc.GetName())
+						}
+						continue
+					}
+					log.V(0).Info("Warning: failed to set HardwareProfile annotation for InferenceService", "isvc", isvc.GetName(), "hwpName", hwpName, "error", errStr)
 					multiErr = multierror.Append(multiErr, fmt.Errorf("failed to set HardwareProfile annotation for InferenceService %s: %w", isvc.GetName(), err))
 					continue
 				}
@@ -505,7 +580,7 @@ func AttachHardwareProfileToInferenceServices(ctx context.Context, cli client.Cl
 		}
 
 		// No AP found, try container size matching
-		// Default usign HWProfile CR "custom-serving", update only if we find a matching size
+		// Default using HWProfile CR "custom-serving", update only if we find a matching size
 		hwpName := customServing
 		var matchedSize string
 
@@ -519,6 +594,17 @@ func AttachHardwareProfileToInferenceServices(ctx context.Context, cli client.Cl
 		}
 
 		if err := setHardwareProfileAnnotation(ctx, cli, isvc, hwpName, applicationNamespace); err != nil {
+			// If webhook rejects due to Serverless mode, record event and skip instead of error
+			errStr := err.Error()
+			if strings.Contains(errStr, "deploymentMode") || strings.Contains(errStr, "Serverless") {
+				log.Info("Skipping HardwareProfile migration for InferenceService due to Serverless mode", "isvc", isvc.GetName(), "error", errStr)
+				if eventErr := recordEvent(ctx, cli, isvc, corev1.EventTypeWarning, eventReasonServerlessMigrationSkipped,
+					fmt.Sprintf("Skipping HardwareProfile migration due to Serverless mode incompatibility: %s", errStr)); eventErr != nil {
+					log.Error(eventErr, "Failed to record event for Serverless InferenceService", "isvc", isvc.GetName())
+				}
+				continue
+			}
+			log.V(0).Info("Warning: failed to set HardwareProfile annotation for InferenceService", "isvc", isvc.GetName(), "hwpName", hwpName, "error", errStr)
 			multiErr = multierror.Append(multiErr, fmt.Errorf("failed to set HardwareProfile annotation for InferenceService %s: %w", isvc.GetName(), err))
 		} else {
 			// Log after successful annotation setting
